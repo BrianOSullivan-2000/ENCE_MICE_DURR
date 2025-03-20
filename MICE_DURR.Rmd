@@ -1,0 +1,449 @@
+---
+title: "R Notebook"
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r}
+## Initial Data Set up ##
+rm(list = ls())
+file.remove("log.txt")
+
+## Import General Use Functions ## 
+source("tools.R")
+source("regression.R")
+source("interpolation.R")
+source("interpolation_st.R")
+import_everything()
+
+source_code <- function(){
+  source("tools.R")
+  source("regression.R")
+  source("interpolation.R")
+  source("interpolation_st.R")
+  import_everything()
+}
+```
+
+```{r}
+
+## Read in data (Rainfall from 1981-2010 with 30%, 50%, and 70% missingness) ##
+
+# rain_70 <- read.csv("../data/70_perc_monthly_rain_1981-2010.csv",
+#                     header = T, sep = ",")[-1]
+# rain_50 <- read.csv("../data/50_perc_monthly_rain_1981-2010.csv",
+#                     header = T, sep = ",")[-1]
+# rain_30 <- read.csv("../data/30_perc_monthly_rain_1981-2010.csv",
+#                     header = T, sep = ",")[-1]
+# rain_15 <- read.csv("../data/15_perc_monthly_rain_1981-2010.csv",
+#                     header = T, sep = ",")[-1]
+# rain_05 <- read.csv("../data/05_perc_monthly_rain_1981-2010.csv",
+#                     header = T, sep = ",")[-1]
+
+## 27 stations in Dublin - for testing and debugging ##
+rain_27 <- 
+  read.csv("../../Rainfall/data/rain_27_stations.csv",
+           header = T, sep = ",")[-c(1)]
+
+```
+
+```{r}
+
+# Impute missing values using MICE (slightly adjusted)
+
+impute_sample <- function(data, newdata, response = "y", 
+                          m = 20, impute_cycles = 5, EM_cycles = 5, 
+                          init_values = F, init_method = "IDW", ...){
+  
+  # data            -observed data
+  # newdata         -missing data to be imputed
+  # response        -response variable (almost always y or qc_rain)
+  # impute_cycles   -number of cycles to produce imputed values in MICE
+  # EM_cycles       -number of total EM cycles to compute missing values
+  # init_values     -this lets you check the initial starting values
+  # init_method     -method for initial values (IDW (default), mean, or sample)
+  
+  ## Data formatting ##
+  
+  # Merge and order data
+  df <- bind_rows(data, newdata)
+  df <- df[order(df$stno, df$t), ]
+  
+  # Label missing data
+  df$mis <- F
+  df[is.na(df[response]), "mis"] <- T
+  
+  # Sort by number of missing values in each station, lowest to highest
+  df <- df %>% group_by(stno) %>% mutate(n_mis = sum(mis)) %>% 
+    arrange(n_mis) %>% dplyr::select(-c("n_mis"))
+
+  # Save original data format
+  df_old_format <- df %>% dplyr::select(-c(response))
+  
+  # If starting values needed for comparison to final values, they are saved
+  if (init_values){
+    starting_values <- df[(df$mis == T), ]
+  }
+  
+  # Initially impute missing data with a simple method
+  if (init_method == "IDW"){
+    
+    # Inverse Distance Weighting
+    df[(df$mis == T), ] <- IDW_raw_ST(df[(df$mis == F), ], df[(df$mis == T), ],
+                                      response = response, C = 15, nmax = 8,
+                                      transformation = sqrt,
+                                      reverse_transformation = 
+                                        {function(x) x^2})
+  }
+  
+  else if (init_method == "mean"){
+    # Mean Imputation
+    df <- df %>% group_by(stno) %>%
+      mutate(across({{response}}, ~replace_na(., mean(., na.rm=TRUE))))
+  }
+
+  else if (init_method == "sample"){
+      # Sample missing values from distribution 
+    df <- df %>% group_by(stno) %>% 
+      mutate({{response}} := 
+               infill_lognorm_monthly(.data[[response]])) %>% ungroup()
+  }
+  
+  else{
+    warning("No valid initial imputation method given. Using default 
+            (IDW) instead")
+    # Inverse Distance Weighting
+    df[(df$mis == T), ] <- IDW_raw_ST(df[(df$mis == F), ], df[(df$mis == T), ],
+                                      response = response, C = 15, nmax = 8,
+                                      transformation = sqrt,
+                                      reverse_transformation = 
+                                        {function(x) x^2})
+  }
+  
+  # Square-Root Transformation of data
+  df[response] <- sqrt(df[response])
+  
+  # Record positions of missing data (long table)
+  mis_idx <- df %>% dplyr::select(t, stno, mis) %>%
+    pivot_wider(names_from = "stno", values_from = "mis") %>%
+    dplyr::select(-c("t")) %>% as.matrix()
+
+  # Make wide table (stations are covariates)
+  df <- df %>% dplyr::select(t, stno, {{response}}) %>%
+    pivot_wider(names_from = "stno", values_from = response) %>%
+    dplyr::select(-c("t"))
+  
+  # Add stno before each column name to avoid errors in formula
+  colnames(mis_idx) <- paste0("stno", colnames(mis_idx))
+  names(df) <- paste0("stno", names(df))
+
+  # Replicate wide table into m copies
+  dfs <- rep(list(df), m)
+  dfs <- mapply(list, 222:(222+(m-1)), rep(list(df), m), 
+              SIMPLIFY = F, USE.NAMES = F)
+  
+  # Make clusters for parallelisation, import necessary functions to each
+  cl <- makeCluster(ifelse(m > 20, 20, m), outfile = "log.txt")
+  clusterExport(cl, c("source_code", "DURR", "extract_best_cvm"),
+                envir=environment())
+  invisible(clusterEvalQ(cl, source_code()))
+  
+  # Get parameters for every imputation model
+  params <- parSapply(cl = cl, dfs, get_params, mis_idx = mis_idx,
+                      cycles = impute_cycles, ...)
+  stopCluster(cl)
+  
+  # # This code is for if you don't want to use parallelisation
+  # params <- sapply(dfs, get_params, mis_idx = mis_idx,
+  #                  cycles = impute_cycles, ...)
+  
+  # Pool parameters from each dataset m together
+  params <- apply(params, 1, {function(x) apply(do.call(cbind, x), 1, mean)})
+  colnames(params) <- names(df)
+  
+  # Loop through imputation cycle multiple times to converge on final values
+  for (i in 1:EM_cycles){
+    
+    # Using RMSE between previous and current cycle as convergence criteria
+    init_vals <- df[mis_idx]
+    old_rmse <- ifelse(i == 1, mean(init_vals), new_rmse)
+    
+    df <- impute_fixed(df, mis_idx, params, ...)
+    print(paste0("Cycle ", i, " completed"))
+    
+    # Check for convergence
+    new_rmse <- rmse(init_vals, df[mis_idx])
+    tol <- 0
+    if (old_rmse / new_rmse < tol){
+      break()
+    }
+  }
+
+  ## Convert back to original data format ##
+  # Make long table again
+  names(df) <- substr(names(df), 5, nchar(names(df)))
+  df <- pivot_longer(df, cols = everything(), 
+                     names_to = "stno", values_to = response)
+  
+  # Fix station order
+  df$stno <- as.numeric(df$stno)
+  df <- df[order(df$stno), ]
+  
+  # Add t column back and merge data
+  l <- as.numeric(table(df$stno)[1])
+  df$t <- rep(1:l, length(unique(df$stno)))
+  df <- left_join(df, df_old_format, by = c("stno", "t"))
+  
+  # Transform data back
+  df[response] <- df[response] ^ 2
+  
+  return(df)
+}
+
+
+
+
+# Get regression coefficients of imputation models for each station (iterating)
+
+get_params <- function(df, mis_idx, cycles = 5, 
+                       hyp_cycles = 2,
+                       lambda_options = c(0.05, 0.1, 0.15, 0.2),
+                       alpha_options = c(0.1, 0.35, 0.65, 0.9), ...){
+  
+  # Extract dataframe and random seed
+  seed <- df[[1]]
+  df <- df[[2]]
+  set.seed(seed)
+  
+  # Parameters saved as vectors in a list
+  params <- list()
+  lambdas <- NA
+  alphas <- NA
+  
+  # Multiple cycles for convergence
+  for (cycle in 1:cycles){
+    
+    # Using RMSE between previous and current cycle as convergence criteria
+    init_vals <- df[mis_idx]
+    old_rmse <- ifelse(cycle == 1, mean(init_vals), new_rmse)
+    
+    # Reset lambdas and alphas if still on early cycles
+    if (cycle < hyp_cycles){
+      lambdas <- NA
+      alphas <- NA
+    }
+    
+    
+    # For each station (columns tracked by count)
+    for (count in 1:ncol(df)){
+
+      # Get Y, X, and locations of missing values for imputation model
+      newdata <- df[, count]
+      data <- df[, -count]
+      mis_vals <- mis_idx[, count]
+        
+      # Get lambda and alpha for this cycle and for this imputation model
+      if(is.na(lambdas[count])){
+        lambda <- lambda_options
+        alpha <- alpha_options
+      }
+      else{
+        lambda <- lambdas[count]
+        alpha <- alphas[count]
+      }
+
+      # Impute values using Direct Use of Regularised Regression (DURR)
+      imp <- DURR(y = unlist(newdata),
+                  ry = unlist(mis_vals),
+                  x = as.matrix(data),
+                  lambda = lambda,
+                  alpha = alpha) 
+        
+      # Get imputed values and fitted lambda
+      df[mis_vals, count] <- imp$y
+      lambdas[count] <- imp$lambda
+      alphas[count] <- imp$alpha
+          
+        # For the last cycle
+        if (cycle == cycles){
+          
+          # Formula of imputation model
+          f <- as.formula(paste(names(newdata),
+                                paste(names(data), collapse = " + "),
+                                sep = " ~ "))
+          
+          # Get betas from Elastic-Net Regression
+          r <- Elastic_Net(df, formula = f, lambda = lambdas[count],
+                           alpha = alphas[count])
+          params[[count]] <- as.matrix(r$coef)
+        }
+      
+      if (count %% 60 == 0){
+        print(count)
+      }
+    }
+    
+    print(paste0("Cycle ", cycle, " completed"))
+    
+     # Check for convergence
+    new_rmse <- rmse(init_vals, df[mis_idx])
+    
+    tol <- 0
+    if (old_rmse / new_rmse < tol){
+      
+      # Get final params
+      for (count in 1:ncol(df)){
+
+      newdata <- df[, count]; data <- df[, -count]
+      mis_vals <- mis_idx[, count]
+        
+      lambda <- lambdas[count]; alpha <- alphas[count]
+      
+      f <- as.formula(paste(names(newdata),
+                            paste(names(data), collapse = " + "),
+                            sep = " ~ "))
+      # Get betas from Elastic-Net Regression
+      r <- Elastic_Net(df, formula = f, lambda = lambdas[count],
+                       alpha = alphas[count])
+      params[[count]] <- as.matrix(r$coef)
+      }
+    break()
+    }
+    
+    }
+  return(params)
+}
+
+
+
+
+# Mice.impute.lasso.norm function from mice (adjusted to be Elastic-Net)
+
+DURR <- function (y, ry, x, nfolds = 10, 
+                  lambda = c(0.05, 0.1, 0.15, 0.2),
+                  alpha = c(0.1, 0.35, 0.65, 0.9), ...) 
+{
+    
+  # Bootstrapping of observed values
+  n1 <- sum(!ry)
+  s <- sample(n1, n1, replace = TRUE)
+  
+  # Matrices for glmnet
+  x_glmnet <- cbind(1, x)
+  dotxobs <- x_glmnet[!ry, , drop = FALSE][s, , drop = FALSE]
+  dotyobs <- y[!ry][s]
+  
+  # Elastic-Net
+  if (length(lambda) > 1){
+    enet <- cva.glmnet(x = dotxobs, y = dotyobs, alpha = alpha, lambda = lambda) 
+    
+    # Get best means from cross validation
+    cvms <- unlist(lapply(enet$modlist, extract_best_cvm))
+    cvms <- matrix(cvms, ncol = 2, byrow = T)
+    best_lambdas <- cvms[,1]; cvms <- cvms[,2]
+    
+    # Get alpha and lambda pair that gives lowest cvm
+    alpha <- alpha[which(cvms == min(cvms))]
+    lambda <- best_lambdas[which(cvms == min(cvms))]
+  }
+  
+  else{
+    enet <- glmnet(x = dotxobs, y = dotyobs, alpha = alpha, lambda = lambda)     
+  }
+  
+  # Regression error
+  s2hat <- mean((predict(enet, dotxobs, s = lambda, alpha = alpha) - dotyobs)^2)
+  
+  # Imputed values sampled
+  y_imp <- predict(enet, x_glmnet[ry, ], s = lambda, alpha = alpha) + 
+    rnorm(sum(ry), 0, sqrt(s2hat))
+  
+  return(list("y" = as.vector(y_imp), "lambda" = lambda, "alpha" = alpha))
+}
+
+
+
+
+extract_best_cvm <- function(cvfit){
+  
+  lambda <- cvfit$lambda.min
+  cvm <- cvfit$cvm[which(cvfit$lambda == lambda)]
+  
+  return(c(lambda, cvm))
+}
+
+
+
+
+# Get final imputed value with pooled regression parameters
+
+impute_fixed <- function(df, mis_idx, params, ...){
+
+  # Impute for each station
+  for (count in 1:ncol(df)){
+    
+    # Get X and positions of missing values
+    data <- as.matrix(df[, -count])
+    mis_vals <- mis_idx[, count]
+    
+    # Get pooled coefficients for given station
+    coefs <- params[, count]
+    
+    # Impute missing values using simple formula: X %*% beta
+    
+    # No need if there are no missing values to begin with
+    if (sum(mis_vals) > 0){
+      
+      # Arguments of base code are wonky if only one missing value
+      if (sum(mis_vals) == 1){
+        X <- c(1, data[mis_vals,])
+        df[mis_vals, count] <- X %*% coefs 
+      }
+      
+      else{
+        df[mis_vals, count] <- cbind(rep(1, nrow(df[mis_vals,])),
+                                     data[mis_vals,]) %*% coefs
+      }
+    }
+  }
+  return(df)
+}
+
+```
+
+
+```{r}
+
+# Previous literature only runs CV on stations with no missing data (45 total)
+# For consistency we'll do the same
+
+# c_45 <- (rain_70 %>% group_by(stno) %>% 
+#            summarise(no_missing = sum(is.na(qc_rain))) %>% 
+#            filter(no_missing == 0))$stno
+
+
+# set.seed(222)
+# cv50 <- CV(rain_27,
+#            impute_sample, response = "qc_rain", LOOCV = F,
+#            m = 20, impute_cycles = 16, EM_cycles = 8, get_results = T)
+# 
+# write.csv(cv50$df, "../../Rainfall/results/paper_2/rain_27/MICE_DURR_CV.csv")
+
+df <- rain_27
+data <- df[!is.na(df$qc_rain), ]
+newdata <- df[is.na(df$qc_rain), ]
+
+st <- Sys.time()
+result_df <- impute_sample(data, newdata, response = "qc_rain",
+                           m = 20, impute_cycles = 16, EM_cycles = 8)
+print(Sys.time() - st)
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
