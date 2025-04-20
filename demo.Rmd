@@ -22,7 +22,7 @@ This takes a little while to run on a local computer so you can load in "simulat
 library(sf)
 
 # Ireland shapefile received from 
-ireland_dsn <- "counties.json"
+ireland_dsn <- "data/counties.json"
 ireland <- read_sf(dsn = ireland_dsn)
 crs <- CRS(SRS_string = "EPSG:29903")
 ireland <- st_transform(x = ireland, crs = crs)
@@ -118,7 +118,7 @@ ggplot() +
 
 
 df <- df[order(df$stno, df$t), ]
-# write.csv(df, "simulated_rainfall.csv")
+# write.csv(df, "data/simulated_rainfall.csv")
 
 ```
 
@@ -133,7 +133,7 @@ source("idw.R")
 source("ENCE.R")
 source("MICE_DURR.R")
 
-rain <- read.csv("simulated_rainfall.csv")
+rain <- read.csv("data/simulated_rainfall.csv")
 
 df_10_perc <- rain
 set.seed(222)
