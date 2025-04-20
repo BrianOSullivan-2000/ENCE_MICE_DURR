@@ -1,0 +1,230 @@
+
+# ENCE and MICE DURR
+
+Elastic-net Chained Equations (ENCE) and Multiple Imputation by Chained Equations with Direct Use of Regularised Regression (MICE DURR) are two regression-based imputation method originally designed to impute incomplete datasets., 
+
+Both methods are originally designed for spatiotemporal monthly rainfall data collected by the Irish monitoring network. They are applicable for a wide variety of datasets however, although they are particularly suitable for high-dimensional climatic data.
+The methods use linear regression models fitted by elastic-net to impute each incomplete column in the data. A column's missing values are updated using the linear model fitted on all other columns in the data, where regularisation from elastic-net provides a robust fit with feature selection capabilities.
+
+Here we present a brief demonstration of ENCE and MICE DURR. Further details can be found in the study at https://doi.org/10.1002/joc.8513
+The data that support the findings of this study are available upon reasonable request to the author(s) and with the permission of Met Éireann, Ireland's meteorological office.
+
+
+### Simulate some data
+
+Here, we'll simulate some station-level climate data using a spatiotemporal Gaussian process. 
+This takes a little while to run on a local computer so you can load in "simulated_rainfall.csv" instead
+
+```{r}
+
+# Load in domain -> Republic of Ireland
+
+library(sf)
+
+# Ireland shapefile received from 
+ireland_dsn <- "counties.json"
+ireland <- read_sf(dsn = ireland_dsn)
+crs <- CRS(SRS_string = "EPSG:29903")
+ireland <- st_transform(x = ireland, crs = crs)
+
+# Simulate some random station locations
+library(spatstat.geom)
+library(spatstat.random)
+
+set.seed(222)
+
+# We'll simulate ten years across three hundred stations
+no_stations <- 300
+no_times <- 120
+stations <- runifpoint(no_stations, win = as.owin(ireland))
+stations <- cbind(stations$x, stations$y)
+
+# Simulate spatiotemporal data for this network
+
+df <- data.frame(stno = rep(1:no_stations, no_times),
+                 east = rep(stations[, 1], no_times),
+                 north = rep(stations[, 2], no_times), 
+                 t = rep(1:no_times, each = no_stations), y = 1)
+
+# We'll use a separable Matern structure - this is pretty quick to simulate
+# Matern covariance function
+matern <- function(x, pars, kappa, ...){
+  
+  sig2 <- pars[1]; phi <- pars[2]
+  nugget <- ifelse(is.na(pars[3]), 0, pars[3])
+  
+  x <- as.matrix(x)
+  xphi <- x/phi
+  corr <- ifelse(xphi == 0, 1,
+                 ((2^(kappa-1)*gamma(kappa))^(-1)) *
+                   ((xphi)^kappa) *
+                   besselK(x = xphi, nu = kappa))
+  
+  V <- (sig2 * corr)
+  V[x == 0] <- V[x == 0] + nugget
+  return(V)
+}
+  
+sd <- as.matrix(dist(stations, diag = T, upper = T))
+td <- outer(0:(no_times-1), 0:(no_times-1), {function(x, y) abs(x-y)})
+
+s_cov_pars <- c(3, 3e5, 0.5)
+t_cov_pars <- c(2, 2, 0.5)
+kappas <- c(1.5, 1.5)
+s_cov <- matern(sd, s_cov_pars, kappas[1])
+t_cov <- matern(td, t_cov_pars, kappas[2])
+
+# Our covariance is the Kronecker product of t_cov with s_cov
+# ie V = V_t %x% V_s
+
+# We just need to simulate data. This can be sped up a lot by taking 
+# advantage of the fact that
+
+# t(chol(V)) = t(chol(V_t)) %x% t(chol(V_s))
+
+L <- t(chol(t_cov)) %x% t(chol(s_cov))
+
+# Add a global mean and a small global spatial trend
+formula <- as.formula("y ~ east + north")
+beta <- c(12, -1.2e-05, 1.3e-06)
+trend <- model.matrix(formula, df) %*% c(beta)
+
+# z -> random errors
+set.seed(222)
+z <- rnorm(no_stations * no_times)
+
+# Final simulated values
+df$y <- trend + (L %*% z)
+
+# Square data so it more closely follows the distribution observed
+# in Irish monthly rainfall
+df$y <- df$y^2
+
+hist(df$y, main = "Simulated Monthly Rainfall", xlab = "mm")
+
+library(ggplot2)
+
+# Lets quickly look at the first month
+ggplot() +
+  geom_sf(data = ireland, color="gray80", fill = "#7affa7") +
+  
+  geom_point(data = df[df$t == 1, ],
+             mapping = aes(x=east, y=north, col=y), 
+             shape = 17, size = 3) + 
+  
+  scale_color_binned(low = "lightblue", high = "darkblue", n.breaks = 8) +
+  theme(axis.title = element_blank(),
+        panel.background = element_rect(fill="#c4fff9"))
+
+
+df <- df[order(df$stno, df$t), ]
+# write.csv(df, "simulated_rainfall.csv")
+
+```
+
+### Evaluate ENCE and MICE DURR
+
+Let's make our simulated dataset incomplete. We'll explore two cases here, removing 10% of the data and 25% of the data. We see here that MICE DURR slightly outperforms ENCE in both cases even when the missingness is small at 10%.
+Computation time mostly depends on the number of stations. Parallel computing can be used to speed up both functions (nclusters argument).
+
+```{r fig.width=14, fig.height=7}
+
+source("idw.R")
+source("ENCE.R")
+source("MICE_DURR.R")
+
+rain <- read.csv("simulated_rainfall.csv")
+
+df_10_perc <- rain
+set.seed(222)
+sample_rows_10 <- sort(sample(nrow(df_10_perc), nrow(df_10_perc)*0.1))
+df_10_perc[sample_rows_10, "y"] <- NA
+data <- df_10_perc[!is.na(df_10_perc$y), ]
+newdata <- df_10_perc[is.na(df_10_perc$y), ]
+
+df_imp_ENCE_10 <- ENCE(df_10_perc, response = "y", max_cycles = 16,
+                       init_method = "mean",
+                       transformation = sqrt,
+                       reverse_transformation = {function(x) x^2}, 
+                       nclusters = 7)
+
+df_imp_MICE_DURR_10 <- MICE_DURR(df_10_perc, response = "y", m = 20,
+                                 max_impute_cycles = 16, hyp_cycles = 2, 
+                                 init_method = "mean",
+                                 max_EM_cycles = 8, 
+                                 nclusters = 7,
+                                 outfile = NULL,
+                                 transformation = sqrt,
+                                 reverse_transformation = {function(x) x^2})
+
+R2 <- function(y1, y2){1 - (sum((y1-y2)^2) / sum((y1 - mean(y1))^2))}
+
+ENCE_rmse_10 <- rmse(rain[sample_rows_10, ]$y, 
+                     df_imp_ENCE_10[sample_rows_10, ]$y)
+ENCE_R2_10 <- R2(rain[sample_rows_10, ]$y, 
+                 df_imp_ENCE_10[sample_rows_10, ]$y)
+MICE_DURR_rmse_10 <- rmse(rain[sample_rows_10, ]$y, 
+                          df_imp_MICE_DURR_10[sample_rows_10, ]$y)
+MICE_DURR_R2_10 <- R2(rain[sample_rows_10, ]$y, 
+                      df_imp_MICE_DURR_10[sample_rows_10, ]$y)
+
+par(mfrow = c(1, 2))
+plot(rain[sample_rows_10, ]$y, df_imp_ENCE_10[sample_rows_10, ]$y, 
+     main = "ENCE", xlab = "Observed (mm)", ylab = "Predicted (mm)")
+abline(0, 1, col="red")
+plot(rain[sample_rows_10, ]$y, df_imp_MICE_DURR_10[sample_rows_10, ]$y,
+     main = "MICE DURR", xlab = "Observed (mm)", ylab = "Predicted (mm)")
+abline(0, 1, col="red")
+
+print(paste0("ENCE RMSE: ", round(ENCE_rmse_10, 3), "mm"))
+print(paste0("ENCE R2: ", round(ENCE_R2_10, 3)))
+print(paste0("MICE_DURR RMSE: ", round(MICE_DURR_rmse_10, 3), "mm"))
+print(paste0("MICE_DURR R2: ", round(MICE_DURR_R2_10, 3)))
+
+```
+
+
+```{r fig.width=14, fig.height=7}
+
+df_25_perc <- rain
+set.seed(222)
+sample_rows_25 <- sort(sample(nrow(df_25_perc), nrow(df_25_perc)*0.25))
+df_25_perc[sample_rows_25, "y"] <- NA
+data <- df_25_perc[!is.na(df_25_perc$y), ]
+newdata <- df_25_perc[is.na(df_25_perc$y), ]
+
+df_imp_ENCE_25 <- ENCE(df_25_perc, response = "y", max_cycles = 16,
+                    transformation = sqrt,
+                    reverse_transformation = {function(x) x^2}, 
+                    nclusters = 7)
+
+df_imp_MICE_DURR_25 <- MICE_DURR(df_25_perc, response = "y", m = 20,
+                              max_impute_cycles = 16, hyp_cycles = 2, init_method = "mean",
+                              max_EM_cycles = 8, 
+                              nclusters = 7,
+                              outfile = NULL,
+                              transformation = sqrt,
+                              reverse_transformation = {function(x) x^2})
+
+R2 <- function(y1, y2){1 - (sum((y1-y2)^2) / sum((y1 - mean(y1))^2))}
+
+ENCE_rmse_25 <- rmse(rain[sample_rows_25, ]$y, df_imp_ENCE_25[sample_rows_25, ]$y)
+ENCE_R2_25 <- R2(rain[sample_rows_25, ]$y, df_imp_ENCE_25[sample_rows_25, ]$y)
+MICE_DURR_rmse_25 <- rmse(rain[sample_rows_25, ]$y, df_imp_MICE_DURR_25[sample_rows_25, ]$y)
+MICE_DURR_R2_25 <- R2(rain[sample_rows_25, ]$y, df_imp_MICE_DURR_25[sample_rows_25, ]$y)
+
+par(mfrow = c(1, 2))
+plot(rain[sample_rows_25, ]$y, df_imp_ENCE_25[sample_rows_25, ]$y, 
+     main = "ENCE", xlab = "Observed (mm)", ylab = "Predicted (mm)")
+abline(0, 1, col="red")
+plot(rain[sample_rows_25, ]$y, df_imp_MICE_DURR_25[sample_rows_25, ]$y,
+     main = "MICE DURR", xlab = "Observed (mm)", ylab = "Predicted (mm)")
+abline(0, 1, col="red")
+
+print(paste0("ENCE RMSE: ", round(ENCE_rmse_25, 3), "mm"))
+print(paste0("ENCE R2: ", round(ENCE_R2_25, 3)))
+print(paste0("MICE_DURR RMSE: ", round(MICE_DURR_rmse_25, 3), "mm"))
+print(paste0("MICE_DURR R2: ", round(MICE_DURR_R2_25, 3)))
+
+```
+
