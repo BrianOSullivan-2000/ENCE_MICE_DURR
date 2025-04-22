@@ -129,9 +129,9 @@ Computation time mostly depends on the number of stations. Parallel computing ca
 
 ```{r fig.width=14, fig.height=7}
 
-source("idw.R")
-source("ENCE.R")
-source("MICE_DURR.R")
+source("scripts/idw.R")
+source("scripts/ENCE.R")
+source("scripts/MICE_DURR.R")
 
 rain <- read.csv("data/simulated_rainfall.csv")
 
