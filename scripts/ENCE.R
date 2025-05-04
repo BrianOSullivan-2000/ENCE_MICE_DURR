@@ -160,6 +160,7 @@ ENCE_impute <- function(df, missing_idx, ls = NA, as = NA, ...){
     # Update covariates and hyper  parameters with imputation model output
     target <- imputed_column$target; df[, column] <- target
     ls[column] <- imputed_column$lambda; as[column] <- imputed_column$alpha
+  }
     
   return(list("df" = df, "ls" = ls, "as" = as))
 }
