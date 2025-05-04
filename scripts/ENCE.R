@@ -18,6 +18,7 @@ ENCE <- function(df, response = "y",
                  init_method = c("mean", "idw"),
                  spatial_id = "stno", time_id = "t",
                  tol = 1,
+                 nclusters = 1,
                  transformation = {function(x) x},
                  reverse_transformation = {function(x) x},
                  ...){
@@ -28,6 +29,8 @@ ENCE <- function(df, response = "y",
   # init_method             -Method for getting starting imputed values
   # spatial_id, time_id     -Column names for locations and times
   # tol                     -Tolerance value for convergence
+  # nclusters               -Number of clusters if doing parallel computing
+  # transformation          -Can do initial transformation of data
   
   # Load in necessary packages
   require(dplyr); require(tidyr)
@@ -67,6 +70,14 @@ ENCE <- function(df, response = "y",
   # Transformation of response
   df[response] <- transformation(df[response])
   
+  if(nclusters > 1){
+    require(parallel)
+    
+    # Make cluster for parallel computing
+    cluster <- makeCluster(nclusters)
+  }
+  else{cluster <- NULL}
+                      
   # Get wide table of missing entry locations
   missing_idx <- df %>% dplyr::select(all_of(c(time_id, spatial_id)), missing) %>%
     pivot_wider(names_from = all_of(spatial_id), 
